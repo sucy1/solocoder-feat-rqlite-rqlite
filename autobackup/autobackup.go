@@ -48,7 +48,7 @@ func (l *defaultLogger) Println(v ...any) {
 }
 
 func New(provider BackupProvider, dir string, interval time.Duration, keepCount int) *Service {
-	if keepCount <= 0 {
+	if keepCount == -1 {
 		keepCount = defaultKeepCount
 	}
 	return &Service{
@@ -144,6 +144,18 @@ func isFileLockedErr(err error) bool {
 		strings.Contains(msg, "device or resource busy")
 }
 
+func canDeleteFile(path string) bool {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_EXCL, 0)
+	if err != nil {
+		if isFileLockedErr(err) {
+			return false
+		}
+		return true
+	}
+	f.Close()
+	return true
+}
+
 func (s *Service) cleanupOld() error {
 	files, err := os.ReadDir(s.dir)
 	if err != nil {
@@ -161,7 +173,7 @@ func (s *Service) cleanupOld() error {
 		}
 	}
 
-	if len(backupFiles) <= s.keepCount {
+	if s.keepCount == 0 || len(backupFiles) <= s.keepCount {
 		return nil
 	}
 
@@ -170,6 +182,10 @@ func (s *Service) cleanupOld() error {
 	toRemove := backupFiles[:len(backupFiles)-s.keepCount]
 	for _, f := range toRemove {
 		fp := filepath.Join(s.dir, f)
+		if !canDeleteFile(fp) {
+			s.logger.Printf("skipping old backup %s: file is in use by another process", f)
+			continue
+		}
 		if err := os.Remove(fp); err != nil {
 			if isFileLockedErr(err) {
 				s.logger.Printf("skipping old backup %s: file is in use", f)

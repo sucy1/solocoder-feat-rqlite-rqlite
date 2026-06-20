@@ -138,13 +138,15 @@ type Config struct {
 	TraceProfile string
 	// Slow query log threshold in milliseconds. -1 uses default of 1000ms. 0 disables slow query logging.
 	SlowQueryLog int
+	// Include SQL query text in slow query log. Default true.
+	SlowQueryLogSQL bool
 	// Include parameter values in slow query log. Default false to avoid logging sensitive data.
 	SlowQueryLogParameters bool
 	// Auto backup interval. Set to 0 to disable.
 	AutoBackupInterval time.Duration
 	// Directory to store auto backups.
 	AutoBackupDir string
-	// Number of auto backups to keep.
+	// Number of auto backups to keep. -1 uses default of 7. 0 keeps all backups (never delete).
 	AutoBackupKeepCount int
 	// Write request queue size. 0 means unlimited.
 	WriteQueueSize int
@@ -224,10 +226,11 @@ func Forge(arguments []string) (*flag.FlagSet, *Config, error) {
 	fs.StringVar(&config.MemProfile, "mem-profile", "", "Path to file for memory profiling information")
 	fs.StringVar(&config.TraceProfile, "trace-profile", "", "Path to file for trace profiling information")
 	fs.IntVar(&config.SlowQueryLog, "slow-query-log", -1, "Slow query log threshold in milliseconds. -1 uses default of 1000ms. 0 disables slow query logging.")
+	fs.BoolVar(&config.SlowQueryLogSQL, "slow-query-log-sql", true, "Include SQL query text in slow query log. Default true.")
 	fs.BoolVar(&config.SlowQueryLogParameters, "slow-query-log-parameters", false, "Include parameter values in slow query log. Default false to avoid logging sensitive data.")
 	fs.DurationVar(&config.AutoBackupInterval, "auto-backup-interval", mustParseDuration("24h"), "Auto backup interval. Set to 0 to disable.")
 	fs.StringVar(&config.AutoBackupDir, "auto-backup-dir", "", "Directory to store auto backups.")
-	fs.IntVar(&config.AutoBackupKeepCount, "auto-backup-keep-count", 7, "Number of auto backups to keep.")
+	fs.IntVar(&config.AutoBackupKeepCount, "auto-backup-keep-count", -1, "Number of auto backups to keep. -1 uses default of 7. 0 keeps all backups (never delete).")
 	fs.IntVar(&config.WriteQueueSize, "write-queue-size", 1000, "Write request queue size. 0 means unlimited.")
 	fs.Float64Var(&config.APIRateLimit, "api-rate-limit", 0, "API rate limit in requests per second per IP. 0 means unlimited.")
 	fs.StringVar(&config.RateLimitWhitelist, "rate-limit-whitelist", "", "Comma-delimited list of IPs whitelisted from rate limiting")

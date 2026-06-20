@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -322,6 +323,7 @@ type Service struct {
 	BuildInfo map[string]any
 
 	SlowQueryThreshold     time.Duration
+	SlowQueryLogSQL        bool
 	SlowQueryLogParameters bool
 	RateLimiter            *rlimit.RateLimiter
 	WriteQueueMaxSize      int
@@ -348,6 +350,7 @@ func New(addr string, store Store, cluster Cluster, pxy *proxy.Proxy, credential
 		statuses:              make(map[string]StatusReporter),
 		credentialStore:       credentials,
 		SlowQueryThreshold:    1000 * time.Millisecond,
+		SlowQueryLogSQL:       true,
 		WriteQueueMaxSize:     1000,
 		WriteQueueWaitTimeout: 5 * time.Second,
 		logger:                log.New(os.Stderr, "[http] ", log.LstdFlags),
@@ -486,8 +489,23 @@ func getClientIP(r *http.Request) string {
 	return host
 }
 
+var (
+	sqlStringLiteralRE = regexp.MustCompile(`'[^']*'`)
+	sqlNumberLiteralRE = regexp.MustCompile(`\b\d+(\.\d+)?\b`)
+	sqlHexLiteralRE    = regexp.MustCompile(`\b0[xX][0-9a-fA-F]+\b`)
+	sqlNullLiteralRE   = regexp.MustCompile(`\bNULL\b`)
+)
+
+func redactSQLLiterals(sql string) string {
+	s := sqlStringLiteralRE.ReplaceAllString(sql, "'?'")
+	s = sqlHexLiteralRE.ReplaceAllString(s, "?")
+	s = sqlNumberLiteralRE.ReplaceAllString(s, "?")
+	s = sqlNullLiteralRE.ReplaceAllString(s, "?")
+	return s
+}
+
 type slowQueryLogEntry struct {
-	Query          string   `json:"query"`
+	Query          string   `json:"query,omitempty"`
 	Parameters     []string `json:"parameters,omitempty"`
 	ParameterCount int      `json:"parameter_count,omitempty"`
 	DurationMs     float64  `json:"duration_ms"`
@@ -505,7 +523,7 @@ func parameterValueToString(p *proto.Parameter) string {
 	case *proto.Parameter_B:
 		return fmt.Sprintf("%t", v.B)
 	case *proto.Parameter_Y:
-		return string(v.Y)
+		return "[REDACTED BLOB]"
 	case *proto.Parameter_S:
 		return v.S
 	default:
@@ -527,7 +545,13 @@ func (s *Service) logSlowQuery(r *http.Request, queries []*proto.Statement, dura
 		if i > 0 {
 			queryStr.WriteString("; ")
 		}
-		queryStr.WriteString(stmt.Sql)
+		if s.SlowQueryLogSQL {
+			sql := stmt.Sql
+			if !s.SlowQueryLogParameters {
+				sql = redactSQLLiterals(sql)
+			}
+			queryStr.WriteString(sql)
+		}
 		paramCount += len(stmt.Parameters)
 		if s.SlowQueryLogParameters {
 			for _, p := range stmt.Parameters {
@@ -537,12 +561,14 @@ func (s *Service) logSlowQuery(r *http.Request, queries []*proto.Statement, dura
 	}
 
 	entry := slowQueryLogEntry{
-		Query:          queryStr.String(),
 		DurationMs:     float64(duration.Microseconds()) / 1000.0,
 		ClientIP:       getClientIP(r),
 		Timestamp:      time.Now().Format(time.RFC3339Nano),
 		Endpoint:       endpoint,
 		ParameterCount: paramCount,
+	}
+	if s.SlowQueryLogSQL {
+		entry.Query = queryStr.String()
 	}
 	if s.SlowQueryLogParameters && len(allParams) > 0 {
 		entry.Parameters = allParams

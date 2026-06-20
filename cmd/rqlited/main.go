@@ -498,6 +498,7 @@ func startHTTPService(cfg *Config, str *store.Store, cltr *cluster.Client, credS
 	} else {
 		s.SlowQueryThreshold = time.Duration(cfg.SlowQueryLog) * time.Millisecond
 	}
+	s.SlowQueryLogSQL = cfg.SlowQueryLogSQL
 	s.SlowQueryLogParameters = cfg.SlowQueryLogParameters
 	s.WriteQueueMaxSize = cfg.WriteQueueSize
 	s.BuildInfo = map[string]any{
