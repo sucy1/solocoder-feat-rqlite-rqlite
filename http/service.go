@@ -32,6 +32,7 @@ import (
 	"github.com/rqlite/rqlite/v10/internal/rtls"
 	"github.com/rqlite/rqlite/v10/proxy"
 	"github.com/rqlite/rqlite/v10/queue"
+	"github.com/rqlite/rqlite/v10/rlimit"
 	"github.com/rqlite/rqlite/v10/store"
 	rsql "github.com/rqlite/sql"
 )
@@ -58,6 +59,9 @@ type Store interface {
 
 	// Ready returns whether the Store is ready to service requests.
 	Ready() bool
+
+	// IsStandalone returns true if the Store is a single-node cluster.
+	IsStandalone() bool
 
 	// Committed blocks until the local commit index is greater than or
 	// equal to the Leader index, as checked when the function is called.
@@ -194,6 +198,11 @@ const (
 	numAuthOK                         = "auth_ok"
 	numAuthFail                       = "auth_fail"
 	numTLSCertFetched                 = "tls_cert_fetched"
+	numSlowQueries                    = "slow_queries"
+	numRateLimited                    = "rate_limited"
+	numWriteQueueFull                 = "write_queue_full"
+	numWriteQueueWaitTimeout          = "write_queue_wait_timeout"
+	writeQueueDepth                   = "write_queue_depth"
 
 	// Default timeout for cluster communications.
 	defaultTimeout = 30 * time.Second
@@ -260,6 +269,11 @@ func ResetStats() {
 	stats.Add(numAuthOK, 0)
 	stats.Add(numAuthFail, 0)
 	stats.Add(numTLSCertFetched, 0)
+	stats.Add(numSlowQueries, 0)
+	stats.Add(numRateLimited, 0)
+	stats.Add(numWriteQueueFull, 0)
+	stats.Add(numWriteQueueWaitTimeout, 0)
+	stats.Add(writeQueueDepth, 0)
 }
 
 // Service provides HTTP service.
@@ -307,6 +321,14 @@ type Service struct {
 
 	BuildInfo map[string]any
 
+	SlowQueryThreshold    time.Duration
+	RateLimiter           *rlimit.RateLimiter
+	WriteQueueMaxSize     int
+	WriteQueueWaitTimeout time.Duration
+	writeQueueCh          chan struct{}
+
+	lastHeartbeat time.Time
+
 	logger *log.Logger
 }
 
@@ -314,17 +336,20 @@ type Service struct {
 // the service performs no authentication and authorization checks.
 func New(addr string, store Store, cluster Cluster, pxy *proxy.Proxy, credentials CredentialStore) *Service {
 	s := &Service{
-		addr:                addr,
-		store:               store,
-		proxy:               pxy,
-		DefaultQueueCap:     1024,
-		DefaultQueueBatchSz: 128,
-		DefaultQueueTimeout: 100 * time.Millisecond,
-		cluster:             cluster,
-		start:               time.Now(),
-		statuses:            make(map[string]StatusReporter),
-		credentialStore:     credentials,
-		logger:              log.New(os.Stderr, "[http] ", log.LstdFlags),
+		addr:                  addr,
+		store:                 store,
+		proxy:                 pxy,
+		DefaultQueueCap:       1024,
+		DefaultQueueBatchSz:   128,
+		DefaultQueueTimeout:   100 * time.Millisecond,
+		cluster:               cluster,
+		start:                 time.Now(),
+		statuses:              make(map[string]StatusReporter),
+		credentialStore:       credentials,
+		SlowQueryThreshold:    1000 * time.Millisecond,
+		WriteQueueMaxSize:     1000,
+		WriteQueueWaitTimeout: 5 * time.Second,
+		logger:                log.New(os.Stderr, "[http] ", log.LstdFlags),
 	}
 	s.uiHandler = http.StripPrefix("/console/", http.FileServerFS(console.Assets))
 	return s
@@ -387,6 +412,8 @@ func (s *Service) Start() error {
 	s.closeCh = make(chan struct{})
 	s.queueDone = make(chan struct{})
 
+	s.writeQueueCh = make(chan struct{}, s.WriteQueueMaxSize)
+
 	s.stmtQueue = queue.New[*proto.Statement](s.DefaultQueueCap, s.DefaultQueueBatchSz, s.DefaultQueueTimeout)
 	go s.runQueue()
 	s.logger.Printf("execute queue processing started with capacity %d, batch size %d, timeout %s",
@@ -438,6 +465,89 @@ func (s *Service) AllowOrigin() string {
 	return s.allowOrigin
 }
 
+func getClientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		if len(parts) > 0 {
+			ip := strings.TrimSpace(parts[0])
+			if ip != "" {
+				return ip
+			}
+		}
+	}
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return xri
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+type slowQueryLogEntry struct {
+	Query      string  `json:"query"`
+	DurationMs float64 `json:"duration_ms"`
+	ClientIP   string  `json:"client_ip"`
+	Timestamp  string  `json:"timestamp"`
+	Endpoint   string  `json:"endpoint"`
+}
+
+func (s *Service) logSlowQuery(r *http.Request, queries []*proto.Statement, duration time.Duration, endpoint string) {
+	if s.SlowQueryThreshold <= 0 || duration < s.SlowQueryThreshold {
+		return
+	}
+
+	stats.Add(numSlowQueries, 1)
+
+	var queryStr strings.Builder
+	for i, stmt := range queries {
+		if i > 0 {
+			queryStr.WriteString("; ")
+		}
+		queryStr.WriteString(stmt.Sql)
+	}
+
+	entry := slowQueryLogEntry{
+		Query:      queryStr.String(),
+		DurationMs: float64(duration.Microseconds()) / 1000.0,
+		ClientIP:   getClientIP(r),
+		Timestamp:  time.Now().Format(time.RFC3339Nano),
+		Endpoint:   endpoint,
+	}
+
+	data, err := json.Marshal(entry)
+	if err != nil {
+		s.logger.Printf("failed to marshal slow query log: %v", err)
+		return
+	}
+	s.logger.Println(string(data))
+}
+
+func (s *Service) acquireWriteSlot(r *http.Request) (func(), bool) {
+	if s.WriteQueueMaxSize <= 0 {
+		return func() {}, true
+	}
+
+	timer := time.NewTimer(s.WriteQueueWaitTimeout)
+	defer timer.Stop()
+
+	select {
+	case s.writeQueueCh <- struct{}{}:
+		stats.Get(writeQueueDepth).(*expvar.Int).Set(int64(len(s.writeQueueCh)))
+		release := func() {
+			<-s.writeQueueCh
+			stats.Get(writeQueueDepth).(*expvar.Int).Set(int64(len(s.writeQueueCh)))
+		}
+		return release, true
+	case <-timer.C:
+		stats.Add(numWriteQueueWaitTimeout, 1)
+		return nil, false
+	case <-r.Context().Done():
+		return nil, false
+	}
+}
+
 // ServeHTTP allows Service to serve HTTP requests.
 func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.addBuildVersion(w)
@@ -449,6 +559,15 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
 		return
+	}
+
+	if s.RateLimiter != nil {
+		clientIP := getClientIP(r)
+		if !s.RateLimiter.Allow(clientIP) {
+			stats.Add(numRateLimited, 1)
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
 	}
 
 	params, err := NewQueryParams(r)
@@ -1160,68 +1279,29 @@ func (s *Service) handleReadyz(w http.ResponseWriter, r *http.Request, qp QueryP
 		return
 	}
 
-	if qp.NoLeader() {
-		// Simply handling the HTTP request is enough.
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("[+]node ok"))
-		return
-	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
-	lAddr, err := s.LeaderAddr(r.Context())
-	if err != nil {
-		if errors.Is(err, ErrLeaderNotFound) {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write([]byte("[+]node ok\n[+]leader does not exist"))
-			return
+	status := "ok"
+	httpStatus := http.StatusOK
+
+	if !s.store.IsStandalone() {
+		if !s.store.Ready() {
+			status = "unavailable"
+			httpStatus = http.StatusServiceUnavailable
+		} else {
+			s.lastHeartbeat = time.Now()
 		}
-		http.Error(w, fmt.Sprintf("leader address: %s", err.Error()), http.StatusInternalServerError)
-		return
-	}
-
-	_, err = s.cluster.GetNodeMeta(r.Context(), lAddr, qp.Retries(0), qp.Timeout(defaultTimeout))
-	if err != nil {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write(fmt.Appendf(nil, "[+]node ok\n[+]leader not contactable: %s", err.Error()))
-		return
-	}
-
-	if !s.store.Ready() {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte("[+]node ok\n[+]leader ok\n[+]store not ready"))
-		return
-	}
-
-	okMsg := "[+]node ok\n[+]leader ok\n[+]store ok"
-	if qp.Sync() {
-		if _, err := s.store.Committed(qp.Timeout(defaultTimeout)); err != nil {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write(fmt.Appendf(nil, "[+]node ok\n[+]leader ok\n[+]store ok\n[+]sync %s", err.Error()))
-			return
-		}
-		okMsg += "\n[+]sync ok"
-	}
-
-	qr := &proto.QueryRequest{
-		Request: &proto.Request{
-			DbTimeout:  qp.Timeout(defaultTimeout).Nanoseconds(),
-			Statements: []*proto.Statement{{Sql: `SELECT 1`}},
-		},
-		Level: proto.ConsistencyLevel_NONE,
-	}
-	results, _, _, err := s.proxy.Query(r.Context(), qr, makeCredentials(r),
-		qp.Timeout(defaultTimeout), 0, false)
-	if err == nil && len(results) == 1 && len(results[0].Values) == 1 &&
-		len(results[0].Values[0].GetParameters()) == 1 && results[0].Values[0].GetParameters()[0].GetI() == 1 {
-		okMsg += "\n[+]db ok"
 	} else {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		okMsg += fmt.Sprintf("\n[+]db not ok: (%v, %v)", err, results)
-		w.Write([]byte(okMsg))
-		return
+		s.lastHeartbeat = time.Now()
 	}
 
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(okMsg))
+	resp := map[string]any{
+		"status":         status,
+		"last_heartbeat": s.lastHeartbeat.Format(time.RFC3339Nano),
+	}
+
+	w.WriteHeader(httpStatus)
+	json.NewEncoder(w).Encode(resp)
 }
 
 // handleLicenses serves the license information.
@@ -1333,11 +1413,19 @@ func (s *Service) queuedExecute(w http.ResponseWriter, r *http.Request, qp Query
 	}
 
 	resp.end = time.Now()
+	s.logSlowQuery(r, stmts, resp.end.Sub(resp.start), "/db/execute?queue")
 	s.writeResponse(w, qp, resp)
 }
 
 // execute handles queries that modify the database.
 func (s *Service) execute(w http.ResponseWriter, r *http.Request, qp QueryParams) {
+	release, ok := s.acquireWriteSlot(r)
+	if !ok {
+		http.Error(w, "write queue full", http.StatusServiceUnavailable)
+		return
+	}
+	defer release()
+
 	resp := NewResponse()
 	resp.Results.AssociativeJSON = qp.Associative()
 	resp.Results.BlobsAsArrays = qp.BlobArray()
@@ -1407,6 +1495,7 @@ func (s *Service) execute(w http.ResponseWriter, r *http.Request, qp QueryParams
 		}
 	}
 	resp.end = time.Now()
+	s.logSlowQuery(r, stmts, resp.end.Sub(resp.start), "/db/execute")
 	s.writeResponse(w, qp, resp)
 }
 
@@ -1500,6 +1589,7 @@ func (s *Service) handleQuery(w http.ResponseWriter, r *http.Request, qp QueryPa
 		}
 	}
 	resp.end = time.Now()
+	s.logSlowQuery(r, queries, resp.end.Sub(resp.start), "/db/query")
 	s.writeResponse(w, qp, resp)
 }
 
@@ -1575,6 +1665,7 @@ func (s *Service) handleRequest(w http.ResponseWriter, r *http.Request, qp Query
 		}
 	}
 	resp.end = time.Now()
+	s.logSlowQuery(r, stmts, resp.end.Sub(resp.start), "/db/request")
 	s.writeResponse(w, qp, resp)
 }
 

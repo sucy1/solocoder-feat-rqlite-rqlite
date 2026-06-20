@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -22,6 +23,7 @@ import (
 	"github.com/rqlite/rqlite/v10/auth"
 	"github.com/rqlite/rqlite/v10/auto/backup"
 	"github.com/rqlite/rqlite/v10/auto/restore"
+	"github.com/rqlite/rqlite/v10/autobackup"
 	"github.com/rqlite/rqlite/v10/cdc"
 	"github.com/rqlite/rqlite/v10/cluster"
 	"github.com/rqlite/rqlite/v10/cluster/disco"
@@ -33,6 +35,7 @@ import (
 	"github.com/rqlite/rqlite/v10/internal/rarchive"
 	"github.com/rqlite/rqlite/v10/internal/rtls"
 	"github.com/rqlite/rqlite/v10/proxy"
+	"github.com/rqlite/rqlite/v10/rlimit"
 	"github.com/rqlite/rqlite/v10/store"
 	"github.com/rqlite/rqlite/v10/tcp"
 )
@@ -245,6 +248,15 @@ func main() {
 		httpServ.RegisterStatus("auto_backups", backupSrv)
 	}
 
+	// Start local auto-backups if configured
+	localBackupSrv, err := startLocalAutoBackups(mainCtx, cfg, str)
+	if err != nil {
+		log.Fatalf("failed to start local auto-backups: %s", err.Error())
+	}
+	if localBackupSrv != nil {
+		httpServ.RegisterStatus("local_auto_backups", localBackupSrv)
+	}
+
 	// Block until done.
 	<-mainCtx.Done()
 
@@ -305,6 +317,28 @@ func startAutoBackups(ctx context.Context, cfg *Config, str *store.Store) (*back
 	u := backup.NewUploader(sc, provider, time.Duration(uCfg.Interval))
 	u.Start(ctx, str.IsLeader)
 	return u, nil
+}
+
+type storeBackupProvider struct {
+	provider *store.Provider
+}
+
+func (p *storeBackupProvider) Backup(w io.Writer) error {
+	return p.provider.Provide(w)
+}
+
+func startLocalAutoBackups(ctx context.Context, cfg *Config, str *store.Store) (*autobackup.Service, error) {
+	if cfg.AutoBackupDir == "" || cfg.AutoBackupInterval <= 0 {
+		return nil, nil
+	}
+
+	provider := &storeBackupProvider{
+		provider: store.NewProvider(str, false, false),
+	}
+	srv := autobackup.New(provider, cfg.AutoBackupDir, cfg.AutoBackupInterval, cfg.AutoBackupKeepCount)
+	srv.SetLogger(log.New(os.Stderr, "[autobackup] ", log.LstdFlags))
+	srv.Start(ctx)
+	return srv, nil
 }
 
 func createExtensionsStore(cfg *Config) (*extensions.Store, error) {
@@ -444,7 +478,6 @@ func createDiscoService(cfg *Config, str *store.Store) (*disco.Service, error) {
 }
 
 func startHTTPService(cfg *Config, str *store.Store, cltr *cluster.Client, credStr *auth.CredentialsStore, pxy *proxy.Proxy) (*httpd.Service, error) {
-	// Create HTTP server and load authentication information.
 	var cs httpd.CredentialStore
 	if credStr != nil {
 		cs = credStr
@@ -460,6 +493,8 @@ func startHTTPService(cfg *Config, str *store.Store, cltr *cluster.Client, credS
 	s.DefaultQueueBatchSz = cfg.WriteQueueBatchSz
 	s.DefaultQueueTimeout = cfg.WriteQueueTimeout
 	s.DefaultQueueTx = cfg.WriteQueueTx
+	s.SlowQueryThreshold = time.Duration(cfg.SlowQueryLog) * time.Millisecond
+	s.WriteQueueMaxSize = cfg.WriteQueueSize
 	s.BuildInfo = map[string]any{
 		"commit":             cmd.Commit,
 		"version":            cmd.Version,
@@ -467,6 +502,16 @@ func startHTTPService(cfg *Config, str *store.Store, cltr *cluster.Client, credS
 		"compiler_command":   cmd.CompilerCommand,
 		"build_time":         cmd.Buildtime,
 	}
+
+	if cfg.APIRateLimit > 0 {
+		rl := rlimit.New(cfg.APIRateLimit, int(cfg.APIRateLimit*2))
+		if cfg.RateLimitWhitelist != "" {
+			whitelist := splitString(cfg.RateLimitWhitelist, ",")
+			rl.SetWhitelist(whitelist)
+		}
+		s.RateLimiter = rl
+	}
+
 	s.SetAllowOrigin(cfg.HTTPAllowOrigin)
 	return s, s.Start()
 }

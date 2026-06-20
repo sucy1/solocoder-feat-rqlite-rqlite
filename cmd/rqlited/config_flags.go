@@ -136,6 +136,20 @@ type Config struct {
 	MemProfile string
 	// Path to file for trace profiling information
 	TraceProfile string
+	// Slow query log threshold in milliseconds. 0 disables slow query logging.
+	SlowQueryLog int
+	// Auto backup interval. Set to 0 to disable.
+	AutoBackupInterval time.Duration
+	// Directory to store auto backups.
+	AutoBackupDir string
+	// Number of auto backups to keep.
+	AutoBackupKeepCount int
+	// Write request queue size. 0 means unlimited.
+	WriteQueueSize int
+	// API rate limit in requests per second per IP. 0 means unlimited.
+	APIRateLimit float64
+	// Comma-delimited list of IPs whitelisted from rate limiting
+	RateLimitWhitelist string
 }
 
 // Forge sets up and parses command-line flags.
@@ -207,6 +221,13 @@ func Forge(arguments []string) (*flag.FlagSet, *Config, error) {
 	fs.StringVar(&config.CPUProfile, "cpu-profile", "", "Path to file for CPU profiling information")
 	fs.StringVar(&config.MemProfile, "mem-profile", "", "Path to file for memory profiling information")
 	fs.StringVar(&config.TraceProfile, "trace-profile", "", "Path to file for trace profiling information")
+	fs.IntVar(&config.SlowQueryLog, "slow-query-log", 1000, "Slow query log threshold in milliseconds. 0 disables slow query logging.")
+	fs.DurationVar(&config.AutoBackupInterval, "auto-backup-interval", mustParseDuration("24h"), "Auto backup interval. Set to 0 to disable.")
+	fs.StringVar(&config.AutoBackupDir, "auto-backup-dir", "", "Directory to store auto backups.")
+	fs.IntVar(&config.AutoBackupKeepCount, "auto-backup-keep-count", 7, "Number of auto backups to keep.")
+	fs.IntVar(&config.WriteQueueSize, "write-queue-size", 1000, "Write request queue size. 0 means unlimited.")
+	fs.Float64Var(&config.APIRateLimit, "api-rate-limit", 0, "API rate limit in requests per second per IP. 0 means unlimited.")
+	fs.StringVar(&config.RateLimitWhitelist, "rate-limit-whitelist", "", "Comma-delimited list of IPs whitelisted from rate limiting")
 	fs.Usage = func() {
 		usage("\nrqlite is a lightweight, distributed relational database, which uses SQLite as its\nstorage engine. It provides an easy-to-use, fault-tolerant store for relational data.\n\nVisit https://www.rqlite.io to learn more.\n\nUsage: rqlited [flags] <data directory>\n")
 		fs.PrintDefaults()
