@@ -321,11 +321,12 @@ type Service struct {
 
 	BuildInfo map[string]any
 
-	SlowQueryThreshold    time.Duration
-	RateLimiter           *rlimit.RateLimiter
-	WriteQueueMaxSize     int
-	WriteQueueWaitTimeout time.Duration
-	writeQueueCh          chan struct{}
+	SlowQueryThreshold     time.Duration
+	SlowQueryLogParameters bool
+	RateLimiter            *rlimit.RateLimiter
+	WriteQueueMaxSize      int
+	WriteQueueWaitTimeout  time.Duration
+	writeQueueCh           chan struct{}
 
 	lastHeartbeat time.Time
 
@@ -486,11 +487,30 @@ func getClientIP(r *http.Request) string {
 }
 
 type slowQueryLogEntry struct {
-	Query      string  `json:"query"`
-	DurationMs float64 `json:"duration_ms"`
-	ClientIP   string  `json:"client_ip"`
-	Timestamp  string  `json:"timestamp"`
-	Endpoint   string  `json:"endpoint"`
+	Query          string   `json:"query"`
+	Parameters     []string `json:"parameters,omitempty"`
+	ParameterCount int      `json:"parameter_count,omitempty"`
+	DurationMs     float64  `json:"duration_ms"`
+	ClientIP       string   `json:"client_ip"`
+	Timestamp      string   `json:"timestamp"`
+	Endpoint       string   `json:"endpoint"`
+}
+
+func parameterValueToString(p *proto.Parameter) string {
+	switch v := p.Value.(type) {
+	case *proto.Parameter_I:
+		return fmt.Sprintf("%d", v.I)
+	case *proto.Parameter_D:
+		return fmt.Sprintf("%f", v.D)
+	case *proto.Parameter_B:
+		return fmt.Sprintf("%t", v.B)
+	case *proto.Parameter_Y:
+		return string(v.Y)
+	case *proto.Parameter_S:
+		return v.S
+	default:
+		return "?"
+	}
 }
 
 func (s *Service) logSlowQuery(r *http.Request, queries []*proto.Statement, duration time.Duration, endpoint string) {
@@ -501,19 +521,31 @@ func (s *Service) logSlowQuery(r *http.Request, queries []*proto.Statement, dura
 	stats.Add(numSlowQueries, 1)
 
 	var queryStr strings.Builder
+	var allParams []string
+	paramCount := 0
 	for i, stmt := range queries {
 		if i > 0 {
 			queryStr.WriteString("; ")
 		}
 		queryStr.WriteString(stmt.Sql)
+		paramCount += len(stmt.Parameters)
+		if s.SlowQueryLogParameters {
+			for _, p := range stmt.Parameters {
+				allParams = append(allParams, parameterValueToString(p))
+			}
+		}
 	}
 
 	entry := slowQueryLogEntry{
-		Query:      queryStr.String(),
-		DurationMs: float64(duration.Microseconds()) / 1000.0,
-		ClientIP:   getClientIP(r),
-		Timestamp:  time.Now().Format(time.RFC3339Nano),
-		Endpoint:   endpoint,
+		Query:          queryStr.String(),
+		DurationMs:     float64(duration.Microseconds()) / 1000.0,
+		ClientIP:       getClientIP(r),
+		Timestamp:      time.Now().Format(time.RFC3339Nano),
+		Endpoint:       endpoint,
+		ParameterCount: paramCount,
+	}
+	if s.SlowQueryLogParameters && len(allParams) > 0 {
+		entry.Parameters = allParams
 	}
 
 	data, err := json.Marshal(entry)

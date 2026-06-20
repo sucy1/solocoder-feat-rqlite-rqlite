@@ -133,6 +133,17 @@ func (s *Service) backup() error {
 	return nil
 }
 
+func isFileLockedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "used by another process") ||
+		strings.Contains(msg, "permission denied") ||
+		strings.Contains(msg, "Access is denied") ||
+		strings.Contains(msg, "device or resource busy")
+}
+
 func (s *Service) cleanupOld() error {
 	files, err := os.ReadDir(s.dir)
 	if err != nil {
@@ -160,7 +171,13 @@ func (s *Service) cleanupOld() error {
 	for _, f := range toRemove {
 		fp := filepath.Join(s.dir, f)
 		if err := os.Remove(fp); err != nil {
-			s.logger.Printf("failed to remove old backup %s: %v", f, err)
+			if isFileLockedErr(err) {
+				s.logger.Printf("skipping old backup %s: file is in use", f)
+			} else {
+				s.logger.Printf("failed to remove old backup %s: %v", f, err)
+			}
+		} else {
+			s.logger.Printf("removed old backup: %s", f)
 		}
 	}
 

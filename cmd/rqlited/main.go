@@ -493,7 +493,12 @@ func startHTTPService(cfg *Config, str *store.Store, cltr *cluster.Client, credS
 	s.DefaultQueueBatchSz = cfg.WriteQueueBatchSz
 	s.DefaultQueueTimeout = cfg.WriteQueueTimeout
 	s.DefaultQueueTx = cfg.WriteQueueTx
-	s.SlowQueryThreshold = time.Duration(cfg.SlowQueryLog) * time.Millisecond
+	if cfg.SlowQueryLog == -1 {
+		s.SlowQueryThreshold = 1000 * time.Millisecond
+	} else {
+		s.SlowQueryThreshold = time.Duration(cfg.SlowQueryLog) * time.Millisecond
+	}
+	s.SlowQueryLogParameters = cfg.SlowQueryLogParameters
 	s.WriteQueueMaxSize = cfg.WriteQueueSize
 	s.BuildInfo = map[string]any{
 		"commit":             cmd.Commit,

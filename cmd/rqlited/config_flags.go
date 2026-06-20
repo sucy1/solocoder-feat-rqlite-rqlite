@@ -136,8 +136,10 @@ type Config struct {
 	MemProfile string
 	// Path to file for trace profiling information
 	TraceProfile string
-	// Slow query log threshold in milliseconds. 0 disables slow query logging.
+	// Slow query log threshold in milliseconds. -1 uses default of 1000ms. 0 disables slow query logging.
 	SlowQueryLog int
+	// Include parameter values in slow query log. Default false to avoid logging sensitive data.
+	SlowQueryLogParameters bool
 	// Auto backup interval. Set to 0 to disable.
 	AutoBackupInterval time.Duration
 	// Directory to store auto backups.
@@ -221,7 +223,8 @@ func Forge(arguments []string) (*flag.FlagSet, *Config, error) {
 	fs.StringVar(&config.CPUProfile, "cpu-profile", "", "Path to file for CPU profiling information")
 	fs.StringVar(&config.MemProfile, "mem-profile", "", "Path to file for memory profiling information")
 	fs.StringVar(&config.TraceProfile, "trace-profile", "", "Path to file for trace profiling information")
-	fs.IntVar(&config.SlowQueryLog, "slow-query-log", 1000, "Slow query log threshold in milliseconds. 0 disables slow query logging.")
+	fs.IntVar(&config.SlowQueryLog, "slow-query-log", -1, "Slow query log threshold in milliseconds. -1 uses default of 1000ms. 0 disables slow query logging.")
+	fs.BoolVar(&config.SlowQueryLogParameters, "slow-query-log-parameters", false, "Include parameter values in slow query log. Default false to avoid logging sensitive data.")
 	fs.DurationVar(&config.AutoBackupInterval, "auto-backup-interval", mustParseDuration("24h"), "Auto backup interval. Set to 0 to disable.")
 	fs.StringVar(&config.AutoBackupDir, "auto-backup-dir", "", "Directory to store auto backups.")
 	fs.IntVar(&config.AutoBackupKeepCount, "auto-backup-keep-count", 7, "Number of auto backups to keep.")
